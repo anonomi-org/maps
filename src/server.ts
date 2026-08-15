@@ -6,6 +6,7 @@ import { join, dirname, isAbsolute } from "path"
 import type { Bbox, CleanupProgress, Coverage, CoverageRun, CoverageTransport, TileFormat, DiscoFile, DiscoMap, LogSettings, Recurrency, RetentionUnit, RunMode, ServerState, SSEEvent, TileMap, TileTransport } from "./types"
 import { countTiles, iterateTiles, buildTileUrl, lon2tileX, lat2tileY, clampLat } from "./tileMath"
 import { validateTile, isTileFile } from "./runner"
+import { RateLimiter, parseRetryAfter, RETRY_AFTER_DEFAULT_MS } from "./rateLimit"
 import { initLandMask, tileIsLand, isLand, maskReady } from "./landMask"
 import {
   initSchema,
@@ -164,40 +165,6 @@ function refreshHostLimits() {
   }
   for (const [service, rate] of strictest) {
     getServiceLimiter(service, rate).setRate(rate)
-  }
-}
-
-class RateLimiter {
-  private tokens: number
-  private lastRefill: number
-  private ratePerMs: number
-  private maxTokens: number
-
-  constructor(maxCallsPerMinute: number) {
-    this.ratePerMs = maxCallsPerMinute / 60_000
-    this.maxTokens = Math.max(1, Math.ceil(maxCallsPerMinute / 10))
-    this.tokens = this.maxTokens
-    this.lastRefill = Date.now()
-  }
-
-  setRate(maxCallsPerMinute: number) {
-    const ratePerMs = maxCallsPerMinute / 60_000
-    if (ratePerMs === this.ratePerMs) return
-    this.ratePerMs = ratePerMs
-    this.maxTokens = Math.max(1, Math.ceil(maxCallsPerMinute / 10))
-    this.tokens = Math.min(this.tokens, this.maxTokens)
-  }
-
-  async wait() {
-    while (true) {
-      const now = Date.now()
-      this.tokens = Math.min(this.maxTokens, this.tokens + (now - this.lastRefill) * this.ratePerMs)
-      this.lastRefill = now
-      if (this.tokens >= 1) { this.tokens -= 1; return }
-      await new Promise<void>((resolve) =>
-        setTimeout(resolve, Math.ceil((1 - this.tokens) / this.ratePerMs)),
-      )
-    }
   }
 }
 
@@ -1596,7 +1563,29 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
               return new Response(null, { status: 204 }) // 304 → 204 No Content (not modified)
             }
             if (!res.ok) {
-              return json({ error: `tile server ${res.status}` }, 502)
+              // 429 and 503 are the two that mean "back off", and the only
+              // useful place to apply that is the shared bucket. Otherwise the
+              // run that drew the rejection waits while every other run on the
+              // same source carries on at full rate.
+              const retryAfterMs =
+                res.status === 429 || res.status === 503
+                  ? parseRetryAfter(res.headers.get("Retry-After")) ?? RETRY_AFTER_DEFAULT_MS
+                  : null
+              if (retryAfterMs !== null) {
+                limiter.backoff(retryAfterMs)
+                console.warn(
+                  `${service} returned ${res.status}; holding every run on this source for ${Math.round(retryAfterMs / 1_000)}s`,
+                )
+              }
+              // Forward the upstream status instead of flattening everything to
+              // 502. The runner decides whether to retry from the status it
+              // sees, so a 404 used to be retried three times over, and a 429
+              // was retried at full speed: the response to being told to slow
+              // down was three times the traffic.
+              return json(
+                { error: `tile server ${res.status}`, retryAfterMs: retryAfterMs ?? undefined },
+                res.status,
+              )
             }
             const buf = await res.arrayBuffer()
             return new Response(buf, { headers: { "Content-Type": "application/octet-stream" } })

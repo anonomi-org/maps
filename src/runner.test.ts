@@ -202,6 +202,91 @@ describe("resume skips what is already on disk", () => {
   }, 30_000)
 })
 
+// The disk had a circuit breaker and the network had none. A source refusing
+// every request did not stop the run: it walked the entire tile list spending
+// three attempts on each, so the answer to a rate limit was more traffic, and
+// the coverage ended up recorded as wholly failed rather than as blocked.
+describe("a rate-limiting source stops the run", () => {
+  function capture(status: number, retryAfter?: string) {
+    const posts: Array<{ path: string; body: Record<string, unknown> }> = []
+    let fetches = 0
+    const srv = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const path = new URL(req.url).pathname
+        if (path === "/control") return Response.json({ command: "none" })
+        if (path === "/fetch") {
+          fetches++
+          const headers: Record<string, string> = {}
+          if (retryAfter) headers["Retry-After"] = retryAfter
+          return Response.json({ error: `tile server ${status}`, retryAfterMs: 0 }, { status, headers })
+        }
+        posts.push({ path, body: (await req.json().catch(() => ({}))) as Record<string, unknown> })
+        return Response.json({ ok: true })
+      },
+    })
+    return { srv, posts, base: `http://127.0.0.1:${srv.port}`, fetchCount: () => fetches }
+  }
+
+  // Zoom 0-7 so the tile list is far longer than the breaker's threshold; if
+  // the breaker never fires the run walks all of it.
+  function runResume(outputDir: string, base: string) {
+    return main(
+      "c", "test-run", "resume", "m",
+      [{ name: "x", bbox: { north: 60, south: -30, west: -120, east: 120 }, marginKm: 0 }] as never,
+      0, 7,
+      "https://example.invalid/{z}/{x}/{y}.jpg", ["a"], 4, 600,
+      outputDir,
+      `${base}/progress`, `${base}/complete`, `${base}/control`,
+      "tok", `${base}/fetch`,
+    )
+  }
+
+  test("a sustained 429 trips the breaker instead of running to the end", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-429-"))
+    // retryAfterMs: 0 in the body, so the test is not waiting out real backoffs.
+    const { srv, posts, base, fetchCount } = capture(429)
+    try {
+      const res = (await runResume(dir, base)) as { status: string }
+
+      expect(res.status).toBe("error")
+      const complete = posts.filter((p) => p.path === "/complete").pop()
+      expect(complete!.body.status).toBe("error")
+      expect(String(complete!.body.error)).toContain("rate limiting")
+
+      // The breaker is 20 consecutive rejections and each tile is attempted at
+      // most 3 times, so a run that stops has made far fewer requests than the
+      // thousands of tiles it was given.
+      expect(fetchCount()).toBeLessThan(200)
+      expect(Number(complete!.body.total)).toBeGreaterThan(1000)
+    } finally {
+      srv.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  // A 404 means the tile is not there and never will be, so retrying it is
+  // pure waste. It used to arrive as a 502 and be attempted three times.
+  test("a 404 is not retried", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-404-"))
+    const { srv, base, fetchCount } = capture(404)
+    try {
+      await main(
+        "c", "test-run", "resume", "m",
+        [{ name: "x", bbox: { north: 38.8, south: 38.7, west: -9.2, east: -9.1 }, marginKm: 0 }] as never,
+        0, 2,
+        "https://example.invalid/{z}/{x}/{y}.jpg", ["a"], 1, 600,
+        dir, `${base}/progress`, `${base}/complete`, `${base}/control`, "tok", `${base}/fetch`,
+      )
+      // Three tiles survive the land mask for this box, one request each.
+      expect(fetchCount()).toBe(3)
+    } finally {
+      srv.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 60_000)
+})
+
 // The server reads tilesOnDisk and sizeBytes off the run-complete body, but
 // nothing ever put them there: validate computed its count, returned it from
 // main(), and the entry point discarded the return value. Both sides looked

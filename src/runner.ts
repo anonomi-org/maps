@@ -347,7 +347,25 @@ export async function main(
   }
   const reportedRejects = new Set<string>()
   const DISK_CIRCUIT_BREAKER = 10
+  // The disk had a breaker and the network had none, so a source that started
+  // refusing every request did not stop the run: it walked the whole tile list,
+  // spent three attempts on each, and recorded the entire coverage as failed.
+  // Rate-limit rejections are counted separately from ordinary fetch failures
+  // because they are the case that gets worse the longer it is ignored.
+  const FETCH_CIRCUIT_BREAKER = 20
+  let consecutiveRateLimits = 0
   const subs = tileSubdomains ?? ["a", "b", "c"]
+
+  // Slept in slices so a pause or cancel is still noticed during a long
+  // backoff, rather than the run sitting deaf for the length of a Retry-After.
+  async function backoffSleep(ms: number) {
+    const until = Date.now() + ms
+    while (Date.now() < until) {
+      if (cancelSignaled || pauseSignaled) return
+      await new Promise<void>((r) => setTimeout(r, Math.min(2_000, until - Date.now())))
+      await pollControl()
+    }
+  }
 
   async function worker() {
     while (true) {
@@ -361,6 +379,12 @@ export async function main(
       if (consecutiveDiskErrors >= DISK_CIRCUIT_BREAKER) {
         cancelSignaled = true
         await finish("error", `Output directory unavailable: ${consecutiveDiskErrors} consecutive write failures`)
+        return
+      }
+
+      if (consecutiveRateLimits >= FETCH_CIRCUIT_BREAKER) {
+        cancelSignaled = true
+        await finish("error", `Tile source is rate limiting: ${consecutiveRateLimits} consecutive rejections, stopping`)
         return
       }
 
@@ -398,6 +422,7 @@ export async function main(
       let buf: ArrayBuffer | null = null
       let skipped304 = false
       let fetchError: string | null = null
+      let rateLimited = false
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -413,15 +438,25 @@ export async function main(
 
           if (res.status === 204) { skipped304 = true; break }
           if (res.ok) { buf = await res.arrayBuffer(); break }
-          const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error: string }
+          const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error: string; retryAfterMs?: number }
           fetchError = err.error
+          if (res.status === 429 || res.status === 503) rateLimited = true
           if (res.status < 500 && res.status !== 429) break // 4xx non-rate-limit: don't retry
-          if (attempt < 2) await new Promise<void>((r) => setTimeout(r, 1_000 * (attempt + 1)))
+          // Wait as long as we were told to. The proxy has already parked the
+          // shared bucket for the same interval, so retrying sooner only burns
+          // this request's 60s timeout sitting in the queue.
+          if (attempt < 2) await backoffSleep(err.retryAfterMs ?? 1_000 * (attempt + 1))
         } catch (e) {
           fetchError = e instanceof Error ? e.message : String(e)
-          if (attempt < 2) await new Promise<void>((r) => setTimeout(r, 1_000 * (attempt + 1)))
+          if (attempt < 2) await backoffSleep(1_000 * (attempt + 1))
         }
+        if (cancelSignaled || pauseSignaled) break
       }
+
+      // Only a clean run of successes clears it, so an intermittent 429 among
+      // otherwise healthy traffic never trips the breaker.
+      if (rateLimited && buf === null && !skipped304) consecutiveRateLimits++
+      else if (buf !== null || skipped304) consecutiveRateLimits = 0
 
       if (skipped304) {
         progress.skipped++
