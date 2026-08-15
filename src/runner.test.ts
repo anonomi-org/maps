@@ -110,3 +110,90 @@ describe("corpus walking", () => {
     }
   }, 30_000)
 })
+
+// The server reads tilesOnDisk and sizeBytes off the run-complete body, but
+// nothing ever put them there: validate computed its count, returned it from
+// main(), and the entry point discarded the return value. Both sides looked
+// right in isolation and the wire between them was never connected, so these
+// assert the posted body rather than the return value.
+describe("validate reports its result to the server", () => {
+  function capture() {
+    const posts: Array<{ path: string; body: Record<string, unknown> }> = []
+    const srv = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const path = new URL(req.url).pathname
+        if (path === "/control") return Response.json({ command: "none" })
+        posts.push({ path, body: (await req.json().catch(() => ({}))) as Record<string, unknown> })
+        return Response.json({ ok: true })
+      },
+    })
+    return { srv, posts, base: `http://127.0.0.1:${srv.port}` }
+  }
+
+  function run(outputDir: string, base: string) {
+    return main(
+      "c", "test-run", "validate", "m",
+      [{ name: "x", bbox: { north: 38.8, south: 38.7, west: -9.2, east: -9.1 }, marginKm: 0 }] as never,
+      0, 2,
+      "https://example.invalid/{z}/{x}/{y}.png", ["a"], 1, 60,
+      outputDir,
+      `${base}/progress`, `${base}/complete`, `${base}/control`,
+      "tok", `${base}/fetch`,
+    )
+  }
+
+  test("a finished walk posts tilesOnDisk and sizeBytes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-report-"))
+    const { srv, posts, base } = capture()
+    try {
+      for (const [z, x, y] of [["0", "0", "0"], ["1", "0", "1"], ["1", "1", "0"], ["2", "3", "3"]]) {
+        mkdirSync(join(dir, "m", z, x), { recursive: true })
+        writeFileSync(join(dir, "m", z, x, `${y}.jpg`), Buffer.alloc(64, 1))
+      }
+      await run(dir, base)
+
+      const complete = posts.filter((p) => p.path === "/complete").pop()
+      expect(complete).toBeDefined()
+      expect(complete!.body.status).toBe("done")
+      expect(complete!.body.tilesOnDisk).toBe(4)
+      expect(complete!.body.sizeBytes).toBe(256)
+    } finally {
+      srv.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  test("an unreachable storage root is an error, not a zero-tile success", async () => {
+    const { srv, posts, base } = capture()
+    try {
+      await run("/nonexistent-storage-root-for-test", base)
+
+      const complete = posts.filter((p) => p.path === "/complete").pop()
+      expect(complete).toBeDefined()
+      // The old behaviour reported "done" here, which the server then stored as
+      // a successful run — and with the fix above would have overwritten a real
+      // tile count with zero.
+      expect(complete!.body.status).toBe("error")
+      expect(String(complete!.body.error)).toContain("Output directory not accessible")
+      expect(complete!.body.tilesOnDisk).toBeUndefined()
+    } finally {
+      srv.stop(true)
+    }
+  }, 30_000)
+
+  test("a reachable root with no map folder is a genuine zero", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-empty-"))
+    const { srv, posts, base } = capture()
+    try {
+      await run(dir, base)
+
+      const complete = posts.filter((p) => p.path === "/complete").pop()
+      expect(complete!.body.status).toBe("done")
+      expect(complete!.body.tilesOnDisk).toBe(0)
+    } finally {
+      srv.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+})

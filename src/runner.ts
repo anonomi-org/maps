@@ -200,24 +200,30 @@ export async function main(
   const tilePath = (z: number, x: number, y: number, fmt: TileFormat) =>
     join(outputDir, mapId, String(z), String(x), `${y}.${fmt}`)
 
-  const finish = async (status: string, error?: string) => {
+  // `extra` carries the fields the server reads but `progress` does not hold.
+  // The server has always looked for tilesOnDisk and sizeBytes on this body;
+  // nothing ever put them there, so a validate returned its count into the
+  // void and the coverage stayed at zero however many tiles were on disk.
+  const finish = async (status: string, error?: string, extra?: Record<string, unknown>) => {
     progress.status = status
     await fetch(completeUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${internalToken}` },
-      body: JSON.stringify({ ...progress, error, tileFormat: detectedFormat ?? undefined }),
+      body: JSON.stringify({ ...progress, error, tileFormat: detectedFormat ?? undefined, ...extra }),
       signal: AbortSignal.timeout(15_000),
     }).catch(() => {})
   }
 
   // ── Output directory check ───────────────────────────────────────────────────
 
-  if (mode !== "validate") {
-    const storageOk = await withTimeout(access(outputDir).then(() => true).catch(() => false), 10_000, false)
-    if (!storageOk) {
-      await finish("error", `Output directory not accessible: ${outputDir}`)
-      return { status: "error" }
-    }
+  // Every mode, validate included. Validate used to skip this and then treat an
+  // unreachable storage root as "done, 0 tiles" — indistinguishable from an
+  // empty corpus, and now that the count is actually transmitted it would
+  // overwrite a real total with zero and mark the coverage healthy.
+  const storageOk = await withTimeout(access(outputDir).then(() => true).catch(() => false), 10_000, false)
+  if (!storageOk) {
+    await finish("error", `Output directory not accessible: ${outputDir}`)
+    return { status: "error" }
   }
 
   await postProgress(progressUrl, internalToken, { ...progress, status: "running" })
@@ -245,10 +251,13 @@ export async function main(
   // ── Validate mode ─────────────────────────────────────────────────────────────
 
   if (mode === "validate") {
-    const mapDir = outputDir ? join(outputDir, mapId) : ""
-    if (!mapDir || !(await withTimeout(access(mapDir).then(() => true).catch(() => false), 10_000, false))) {
+    // The storage root is already known reachable by here, so a missing map
+    // folder is the one case that genuinely means zero: a corpus nobody has
+    // downloaded yet, not a fault.
+    const mapDir = join(outputDir, mapId)
+    if (!(await withTimeout(access(mapDir).then(() => true).catch(() => false), 10_000, false))) {
       await postProgress(progressUrl, internalToken, { ...progress, status: "done" })
-      await finish("done")
+      await finish("done", undefined, { tilesOnDisk: 0, sizeBytes: 0 })
       return { status: "done", tilesOnDisk: 0, sizeBytes: 0 }
     }
 
@@ -273,7 +282,14 @@ export async function main(
     await walkDir(mapDir)
     const finalStatus = cancelSignaled ? "cancelled" : pauseSignaled ? "paused" : "done"
     await postProgress(progressUrl, internalToken, { ...progress, status: finalStatus })
-    await finish(finalStatus)
+    // A cancelled or paused walk stopped partway, so its count is a floor, not
+    // a total. Only send it when the walk actually finished, or an interrupted
+    // validate would write a low number over a correct one.
+    await finish(
+      finalStatus,
+      undefined,
+      finalStatus === "done" ? { tilesOnDisk: progress.done, sizeBytes: progress.bytes } : undefined,
+    )
     return { status: finalStatus, tilesOnDisk: progress.done, sizeBytes: progress.bytes }
   }
 
