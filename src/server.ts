@@ -757,6 +757,24 @@ function computeNextRunAt(recurrency: Recurrency): string {
   return d.toISOString()
 }
 
+// A failed run used to leave nextRunAt untouched, and the only place that sets
+// it is the success path, so one failure disarmed recurrence permanently: the
+// coverage went dormant until somebody noticed and started it by hand. The
+// failures that caused it here were transient (a server restart mid-run, a NAS
+// write timeout), which is exactly the case worth retrying.
+//
+// Retries use their own backoff rather than the configured interval, because
+// that interval is 7 to 90 days — long enough that "retry at the normal time"
+// is indistinguishable from giving up.
+const RETRY_MAX = 5
+const RETRY_BASE_MS = 5 * 60_000
+const RETRY_CAP_MS = 6 * 60 * 60_000
+
+function computeRetryAt(consecutiveFailures: number): string {
+  const backoff = Math.min(RETRY_BASE_MS * 2 ** (consecutiveFailures - 1), RETRY_CAP_MS)
+  return new Date(Date.now() + backoff).toISOString()
+}
+
 // setTimeout takes a signed 32-bit delay, about 24.9 days. Recurrency goes up to
 // 90, so anything longer has to be split into chunks or it fires immediately.
 const MAX_TIMEOUT_MS = 2_147_483_647
@@ -1466,6 +1484,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
 
             if (finalStatus === "done") {
               coverage.lastRunStatus = run.failed > 0 ? "partial" : "success"
+              coverage.consecutiveFailures = 0
               if (body.tilesOnDisk != null) coverage.tilesOnDisk = body.tilesOnDisk
               if (body.sizeBytes != null) coverage.sizeBytes = body.sizeBytes
               if (coverage.recurrency !== "none") {
@@ -1473,10 +1492,23 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
                 scheduleNextRun(coverage)
               }
             } else if (finalStatus === "cancelled") {
+              // Deliberate stop. Leave the schedule exactly as it was rather
+              // than arguing with the person who pressed cancel.
               coverage.lastRunStatus = "cancelled"
             } else {
               coverage.lastRunStatus = "failed"
               coverage.totalFailedRuns++
+              if (coverage.recurrency !== "none") {
+                const n = (coverage.consecutiveFailures ?? 0) + 1
+                coverage.consecutiveFailures = n
+                // After RETRY_MAX consecutive failures the fault is not
+                // transient, so fall back to the configured interval instead
+                // of retrying against a source or a disk that is not coming
+                // back. The coverage stays scheduled either way.
+                coverage.nextRunAt =
+                  n <= RETRY_MAX ? computeRetryAt(n) : computeNextRunAt(coverage.recurrency)
+                scheduleNextRun(coverage)
+              }
             }
 
             await dbSaveCoverage(coverage)

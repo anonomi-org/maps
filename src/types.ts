@@ -78,6 +78,9 @@ export type Coverage = {
   nextRunAt: string | null
   totalRuns: number
   totalFailedRuns: number
+  // Consecutive failures since the last success, which drives the retry
+  // backoff. Absent on rows written before retries existed; treat as 0.
+  consecutiveFailures?: number
 
   // Tile inventory
   totalTilesExpected: number

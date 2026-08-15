@@ -854,3 +854,140 @@ describe("auth.json permissions", () => {
     expect(statSync(join(permDir, "auth.json")).mode & 0o777).toBe(0o600)
   })
 })
+
+// A failed run used to leave nextRunAt untouched, and the success path is the
+// only place that sets it, so a single failure disarmed recurrence for good:
+// the coverage went dormant with no signal beyond a null field. The failures
+// that caused it on the live host were transient (a restart mid-run, a NAS
+// write timeout), which is exactly the case worth retrying. Retries use their
+// own short backoff because the configured interval is 7 to 90 days.
+describe("a failed run re-arms its own schedule", () => {
+  let token: string
+  let coverageId: string
+
+  async function api(path: string, body: unknown) {
+    const res = await fetch(`${BASE}/api/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    })
+    return { status: res.status, body: await res.json().catch(() => null) }
+  }
+
+  async function serverState(): Promise<{
+    coverages: Array<{ id: string; nextRunAt: string | null; consecutiveFailures?: number; lastRunStatus: string | null }>
+    activeRuns: Array<{ id: string; coverageId: string }>
+  }> {
+    const res = await fetch(`${BASE}/api/events`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(4000),
+    })
+    const reader = res.body!.getReader()
+    const { value } = await reader.read()
+    reader.cancel()
+    const text = new TextDecoder().decode(value)
+    return JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1)).payload
+  }
+
+  async function finishRun(runId: string, status: string) {
+    return fetch(`${BASE}/api/internal/run-complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-secret" },
+      body: JSON.stringify({ runId, status, error: status === "error" ? "NAS unavailable" : undefined }),
+    })
+  }
+
+  // Starts a run and returns its id, read back from the state frame because
+  // runs/start answers with {ok:true} and nothing else.
+  async function startAndGetRunId(): Promise<string> {
+    const started = await api("runs/start", { coverageId })
+    expect(started.status).toBe(200)
+    const run = (await serverState()).activeRuns.find((r) => r.coverageId === coverageId)
+    expect(run).toBeDefined()
+    return run!.id
+  }
+
+  async function coverage() {
+    const c = (await serverState()).coverages.find((x) => x.id === coverageId)
+    expect(c).toBeDefined()
+    return c!
+  }
+
+  test("set up a recurring coverage", async () => {
+    const login = await fetch(`${BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "correct-horse-battery" }),
+    })
+    token = (await login.json()).token
+
+    const map = await api("maps/create", { name: "retry map" })
+    expect(map.status).toBe(200)
+
+    const cov = await api("coverages/create", {
+      mapId: map.body.map.id,
+      name: "retry-cov",
+      regions: [{ name: "tiny", bbox: { north: 38.8, south: 38.7, west: -9.2, east: -9.1 }, marginKm: 0 }],
+      zoomMin: 0, zoomMax: 1,
+      tileSource: "https://unreachable.example.test/{z}/{x}/{y}.png",
+      tileSubdomains: ["a"],
+      // The whole point: recurrence is configured, so a failure must not
+      // silently switch it off.
+      recurrency: "normal", workers: 1, maxCallsPerMinute: 60,
+    })
+    expect(cov.status).toBe(200)
+    coverageId = cov.body.coverage.id
+    // A brand new coverage starts unscheduled; the first run is manual.
+    expect(cov.body.coverage.nextRunAt).toBeNull()
+  }, 30_000)
+
+  test("an errored run schedules a retry instead of going dormant", async () => {
+    const res = await finishRun(await startAndGetRunId(), "error")
+    expect(res.status).toBe(200)
+
+    const c = await coverage()
+    expect(c.lastRunStatus).toBe("failed")
+    expect(c.consecutiveFailures).toBe(1)
+    expect(c.nextRunAt).not.toBeNull()
+
+    // First retry is ~5 minutes out, which must be nowhere near the 30 day
+    // "normal" interval — re-arming at that interval would be giving up.
+    const delayMs = new Date(c.nextRunAt!).getTime() - Date.now()
+    expect(delayMs).toBeGreaterThan(60_000)
+    expect(delayMs).toBeLessThan(10 * 60_000)
+  }, 30_000)
+
+  test("consecutive failures back off further", async () => {
+    await finishRun(await startAndGetRunId(), "error")
+
+    const c = await coverage()
+    expect(c.consecutiveFailures).toBe(2)
+    // Second failure doubles to ~10 minutes.
+    const delayMs = new Date(c.nextRunAt!).getTime() - Date.now()
+    expect(delayMs).toBeGreaterThan(9 * 60_000)
+    expect(delayMs).toBeLessThan(15 * 60_000)
+  }, 30_000)
+
+  test("a cancel leaves the schedule alone rather than retrying", async () => {
+    const before = await coverage()
+    await finishRun(await startAndGetRunId(), "cancelled")
+
+    const after = await coverage()
+    expect(after.lastRunStatus).toBe("cancelled")
+    // Untouched: cancelling is deliberate, so it must not re-arm or reset.
+    expect(after.nextRunAt).toBe(before.nextRunAt)
+    expect(after.consecutiveFailures).toBe(2)
+  }, 30_000)
+
+  test("a success clears the failure counter and restores the normal interval", async () => {
+    await finishRun(await startAndGetRunId(), "done")
+
+    const c = await coverage()
+    expect(c.lastRunStatus).toBe("success")
+    expect(c.consecutiveFailures).toBe(0)
+    // Back to the configured 30 day cadence, not a retry backoff.
+    const days = (new Date(c.nextRunAt!).getTime() - Date.now()) / 86_400_000
+    expect(days).toBeGreaterThan(29)
+    expect(days).toBeLessThan(31)
+  }, 30_000)
+})
