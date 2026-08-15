@@ -1,0 +1,29 @@
+# Example unit. Adjust User, WorkingDirectory and the bun path for your host,
+# then install to /etc/systemd/system/maps.service.
+#
+# If the output directory is a network mount, add its unit to After= and
+# Requires= so downloads cannot start against a directory that is not there yet.
+
+[Unit]
+Description=Maps tile downloader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=maps
+Group=maps
+WorkingDirectory=/opt/maps
+Environment=NODE_ENV=production
+# Keep runtime state off the source tree so a deploy cannot delete it.
+Environment=STATE_DIR=/var/lib/maps
+Environment=PATH=/opt/maps/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=INTERNAL_BASE_URL=http://localhost:3001
+ExecStart=/opt/maps/.bun/bin/bun src/server.ts
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

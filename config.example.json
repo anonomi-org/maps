@@ -1,0 +1,8 @@
+{
+  "outputDir": "/Volumes/YourDisk/tiles",
+  "onionUrl": "",
+  "internalSecret": "",
+  "maxConcurrentRuns": 2,
+  "tileTransport": "clearnet",
+  "torProxyUrl": "http://127.0.0.1:9080"
+}

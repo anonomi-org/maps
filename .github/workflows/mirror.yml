@@ -1,0 +1,33 @@
+name: Mirror to Codeberg
+
+# Deliberately carries no `needs:` on the CI gate. A mirror that only runs when
+# the tests pass stops replicating exactly when the repository is in a state
+# somebody might need to look at from elsewhere.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only main is ever mirrored, and there is no pull_request trigger on purpose:
+# `git push --mirror` from a pull request ref would rewrite the mirror's
+# branches to match that pull request.
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # A shallow clone cannot be mirrored: the push is rejected for the
+          # history it does not have.
+          fetch-depth: 0
+
+      - name: Mirror to Codeberg
+        run: |
+          git remote add codeberg https://${{ secrets.CODEBERG_TOKEN }}@codeberg.org/Anonomi/maps.git
+          git push --mirror codeberg

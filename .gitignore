@@ -1,0 +1,22 @@
+node_modules/
+dist/
+config.json
+auth.json
+maps.db
+maps.db-shm
+maps.db-wal
+# Pre-rename database. Still ignored so an install that has not started since
+# the rename cannot commit one by accident.
+maps-manager.db
+maps-manager.db-shm
+maps-manager.db-wal
+land.json
+land-mask.bin
+logs/
+*.local
+.DS_Store
+
+# Superseded by the SQLite database; imported once on first start.
+maps.json
+coverages.json
+runs.json

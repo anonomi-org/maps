@@ -1,0 +1,77 @@
+name: CI
+
+# A gate, not a deployment. The server this ships to is not reachable from the
+# public internet, so no hosted runner can push to it and deployment stays a
+# manual step. See the deploy section in README.md.
+
+on:
+  push:
+    branches: [main]
+  # Runs the same gate on a pull request, so a change that fails is caught
+  # before it reaches main rather than after.
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Nothing here publishes, so the token only needs to read the checkout.
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed by ref: a pull request check must not cancel a run on main.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # land.json and land-mask.bin are derived and gitignored, so a clean
+      # checkout has neither and the first run downloads Natural Earth. Caching
+      # them keeps the suite from depending on a third party being reachable on
+      # every push.
+      #
+      # The key is exact, with no restore-keys, on purpose: src/landMask.ts holds
+      # both the source URLs and the grid resolution, and the loader only checks
+      # that the cache file exists. A mask restored from a different resolution
+      # would be silently wrong rather than obviously stale.
+      - name: Cache land mask
+        uses: actions/cache@v6
+        with:
+          path: |
+            land.json
+            land-mask.bin
+          key: land-mask-${{ hashFiles('src/landMask.ts') }}
+
+      # Build the mask before the suite rather than inside it. Rasterising is
+      # synchronous and takes about ten seconds on a two core runner, and doing
+      # it inside a test blocks the server boots that other tests are waiting on.
+      # On a cache hit this is a no-op that logs and returns.
+      - name: Warm land mask
+        run: bun -e 'import { initLandMask } from "./src/landMask"; await initLandMask()'
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # The dashboard is bundled into dist/ at build time and the deployed server
+      # has no node_modules, so a broken import here is a broken deploy.
+      - name: Build dashboard
+        run: bun run build
+
+      # Last, because it is the slow one: it boots real servers on a disposable
+      # state directory. The raised timeout is for the runner, not the suite.
+      # bun allows a test 5s by default, and on two shared cores a bcrypt hash
+      # behind a real HTTP round trip does not reliably fit in that.
+      - name: Test
+        run: bun test --timeout=30000
