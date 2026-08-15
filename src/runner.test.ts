@@ -111,6 +111,97 @@ describe("corpus walking", () => {
   }, 30_000)
 })
 
+// Resume decides "already have it" from a cached readdir of the {z}/{x} column
+// rather than a stat per tile. That is a speed change, but it rewrites the
+// lookup, and getting the filename match wrong would turn a skip into a
+// re-download of the entire corpus, silently at that, because a re-download
+// still succeeds. These pin the contract: every tile already on disk is
+// skipped, in either extension, without a single fetch leaving the runner.
+describe("resume skips what is already on disk", () => {
+  function capture() {
+    const posts: Array<{ path: string; body: Record<string, unknown> }> = []
+    let fetches = 0
+    const srv = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const path = new URL(req.url).pathname
+        if (path === "/control") return Response.json({ command: "none" })
+        if (path === "/fetch") { fetches++; return Response.json({ error: "should not be reached" }, { status: 500 }) }
+        posts.push({ path, body: (await req.json().catch(() => ({}))) as Record<string, unknown> })
+        return Response.json({ ok: true })
+      },
+    })
+    return { srv, posts, base: `http://127.0.0.1:${srv.port}`, fetchCount: () => fetches }
+  }
+
+  // A superset of whatever the run asks for: the land mask only ever removes
+  // tiles from the box, so covering the whole box needs no guess about which
+  // tiles survive it.
+  function seedBox(dir: string, zMax: number, fmtFor: (z: number) => string) {
+    for (let z = 0; z <= zMax; z++) {
+      const n = 2 ** z
+      for (let x = 0; x < n; x++) {
+        mkdirSync(join(dir, "m", String(z), String(x)), { recursive: true })
+        for (let y = 0; y < n; y++) {
+          writeFileSync(join(dir, "m", String(z), String(x), `${y}.${fmtFor(z)}`), Buffer.alloc(64, 1))
+        }
+      }
+    }
+  }
+
+  function runResume(outputDir: string, base: string) {
+    return main(
+      "c", "test-run", "resume", "m",
+      [{ name: "x", bbox: { north: 38.8, south: 38.7, west: -9.2, east: -9.1 }, marginKm: 0 }] as never,
+      0, 2,
+      "https://example.invalid/{z}/{x}/{y}.png", ["a"], 1, 60,
+      outputDir,
+      `${base}/progress`, `${base}/complete`, `${base}/control`,
+      "tok", `${base}/fetch`,
+    )
+  }
+
+  // Mixed on purpose: the corpus is .jpg, but tiles written before the source
+  // changed format are .png, and both have to count as present.
+  test("finds both extensions and fetches nothing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-resume-"))
+    const { srv, posts, base, fetchCount } = capture()
+    try {
+      seedBox(dir, 2, (z) => (z < 2 ? "png" : "jpg"))
+      await runResume(dir, base)
+
+      const complete = posts.filter((p) => p.path === "/complete").pop()
+      expect(complete).toBeDefined()
+      expect(complete!.body.status).toBe("done")
+      expect(complete!.body.skipped).toBe(complete!.body.total)
+      expect(complete!.body.skipped).toBeGreaterThan(0)
+      expect(complete!.body.done).toBe(0)
+      expect(complete!.body.failed).toBe(0)
+      expect(fetchCount()).toBe(0)
+    } finally {
+      srv.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  // The complement: an empty corpus must still reach the network for every
+  // tile, so the check above cannot be passing by skipping everything blindly.
+  test("an empty corpus still fetches", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runner-resume-empty-"))
+    const { srv, posts, base, fetchCount } = capture()
+    try {
+      await runResume(dir, base)
+
+      const complete = posts.filter((p) => p.path === "/complete").pop()
+      expect(complete!.body.skipped).toBe(0)
+      expect(fetchCount()).toBeGreaterThan(0)
+    } finally {
+      srv.stop(true)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+})
+
 // The server reads tilesOnDisk and sizeBytes off the run-complete body, but
 // nothing ever put them there: validate computed its count, returned it from
 // main(), and the entry point discarded the return value. Both sides looked

@@ -318,6 +318,33 @@ export async function main(
   let consecutiveDiskErrors = 0
   // Directories this run has already created, shared across workers.
   const createdDirs = new Set<string>()
+
+  // Existence is checked one directory at a time, not one tile at a time.
+  // A per-tile stat cost up to two mount round-trips (.png, then .jpg) before
+  // any network call, so a resume over an already-complete corpus spent all of
+  // its time confirming what it already had: 188 present tiles took 549s on the
+  // live NAS, and re-checking the whole corpus at that rate is days, not hours.
+  // Tiles arrive in z/x/y order, so one readdir of {z}/{x} answers for the
+  // whole column.
+  //
+  // Bounded, because a global corpus has thousands of columns. Workers only
+  // ever straddle a boundary or two, and an eviction costs a re-read rather
+  // than a wrong answer.
+  const DIR_CACHE_MAX = 8
+  const dirCache = new Map<string, Promise<Set<string>>>()
+  function listTileDir(dir: string): Promise<Set<string>> {
+    const hit = dirCache.get(dir)
+    if (hit) return hit
+    // A directory that does not exist yet is the normal case on a first
+    // download, so a failed readdir means "nothing here", not a fault. Sharing
+    // the pending promise keeps concurrent workers to one read per column.
+    const pending = withTimeout(readdir(dir).catch(() => [] as string[]), 10_000, [] as string[])
+      .then((names) => new Set(names))
+    dirCache.set(dir, pending)
+    // Insertion order is eviction order.
+    if (dirCache.size > DIR_CACHE_MAX) dirCache.delete(dirCache.keys().next().value as string)
+    return pending
+  }
   const reportedRejects = new Set<string>()
   const DISK_CIRCUIT_BREAKER = 10
   const subs = tileSubdomains ?? ["a", "b", "c"]
@@ -341,17 +368,17 @@ export async function main(
       if (i >= allTiles.length) break
 
       const [z, x, y] = allTiles[i]
-      // Extension is decided by what actually came back, so a source that
-      // switches format cannot silently write mislabelled files.
-      const filePath = tilePath(z, x, y, detectedFormat ?? "png")
 
-      // Check existing file. A tile written on an earlier run may carry either
-      // extension, so look for both, because checking only one makes resume re-download
-      // everything the moment the source's format changes.
-      let fileStat = await withTimeout(stat(tilePath(z, x, y, "png")).catch(() => null), 5_000, null)
-      if (!fileStat) fileStat = await withTimeout(stat(tilePath(z, x, y, "jpg")).catch(() => null), 5_000, null)
+      // A tile written on an earlier run may carry either extension, so both
+      // are checked. Looking for only one makes resume re-download everything
+      // the moment the source's format changes. Against the cached listing both
+      // lookups are free, so there is no cheaper order to guess at.
+      const tileDir = join(outputDir, mapId, String(z), String(x))
+      const names = await listTileDir(tileDir)
+      const existingFormat: TileFormat | null =
+        names.has(`${y}.jpg`) ? "jpg" : names.has(`${y}.png`) ? "png" : null
 
-      if (mode === "resume" && fileStat !== null) {
+      if (mode === "resume" && existingFormat !== null) {
         progress.skipped++
         consecutiveDiskErrors = 0
         await maybePostProgress()
@@ -360,7 +387,13 @@ export async function main(
 
       // Fetch via maps throttle proxy: proxy handles rate limiting + upstream fetch
       const tileUrl = buildTileUrl(tileSource, z, x, y, subs[Math.floor(Math.random() * subs.length)])
-      const ifModifiedSince = mode === "update" && fileStat ? (fileStat as { mtime: Date }).mtime.toUTCString() : undefined
+      // Only `update` needs the mtime, and only for a tile that exists. readdir
+      // does not carry mtime, so this is the one case that still pays for a
+      // stat: one, against the extension now known to be on disk.
+      const fileStat = mode === "update" && existingFormat
+        ? await withTimeout(stat(tilePath(z, x, y, existingFormat)).catch(() => null), 5_000, null)
+        : null
+      const ifModifiedSince = fileStat ? (fileStat as { mtime: Date }).mtime.toUTCString() : undefined
 
       let buf: ArrayBuffer | null = null
       let skipped304 = false
@@ -412,6 +445,8 @@ export async function main(
             // the client asks for .png, the corpus is .jpg, every tile 404s.
             await postProgress(progressUrl, internalToken, { ...progress, tileFormat: check.format })
           }
+          // Extension is decided by what actually came back, so a source that
+          // switches format cannot silently write mislabelled files.
           const filePath = tilePath(z, x, y, check.format)
           const dir = dirname(filePath)
           try {
@@ -423,6 +458,10 @@ export async function main(
               createdDirs.add(dir)
             }
             await withTimeout(writeFile(filePath, Buffer.from(buf)), 30_000, undefined)
+            // Overlapping regions can queue the same tile twice, and the
+            // listing for this column was read before the write. Without this
+            // the second visit would not see the file and would fetch it again.
+            names.add(`${y}.${check.format}`)
             progress.done++
             progress.bytes += buf.byteLength
             consecutiveDiskErrors = 0
