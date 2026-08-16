@@ -8,6 +8,7 @@ import { countTiles, iterateTiles, buildTileUrl, lon2tileX, lat2tileY, clampLat,
 import { validateTile, isTileFile } from "./runner"
 import { RateLimiter, parseRetryAfter, RETRY_AFTER_DEFAULT_MS } from "./rateLimit"
 import { initLandMask, tileIsLand, isLand, maskReady } from "./landMask"
+import { queueInStartOrder, nextInStartOrder } from "./runQueue"
 import {
   initSchema,
   dbLoadMaps, dbSaveMap, dbDeleteMap,
@@ -395,8 +396,15 @@ function slotsInUse(): number {
   return activeProcesses.size
 }
 
+// A queued run inherits its coverage's priority. Absent counts as 0, so an
+// untouched deployment keeps behaving as the FIFO this replaced.
+function runPriority(runId: string): number {
+  const coverageId = activeRuns.get(runId)?.coverageId
+  return coverages.find((c) => c.id === coverageId)?.priority ?? 0
+}
+
 function broadcastQueue() {
-  const waiting = runQueue
+  const waiting = queueInStartOrder(runQueue, runPriority)
     .map((runId) => activeRuns.get(runId)?.coverageId)
     .filter((id): id is string => id !== undefined)
   broadcast({ type: "queue", payload: waiting })
@@ -404,7 +412,8 @@ function broadcastQueue() {
 
 function releaseSlotAndStartNext() {
   while (slotsInUse() < maxConcurrentRuns && runQueue.length > 0) {
-    const runId = runQueue.shift()!
+    const runId = nextInStartOrder(runQueue, runPriority)!
+    runQueue.splice(runQueue.indexOf(runId), 1)
     const run = activeRuns.get(runId)
     if (!run || run.status !== "queued") continue
 
@@ -679,7 +688,12 @@ function validateCoverageShape(c: {
   zoomMax?: unknown
   workers?: unknown
   maxCallsPerMinute?: unknown
+  priority?: unknown
 }): string | null {
+  // The queue sorts on this, and a NaN or a string would make that sort
+  // incoherent rather than loud, so it is rejected at the edge.
+  if (c.priority != null && (!Number.isInteger(c.priority) || !inRange(c.priority, -1000, 1000)))
+    return "priority must be an integer between -1000 and 1000"
   if (!Number.isInteger(c.zoomMin) || !inRange(c.zoomMin, 0, MAX_ZOOM))
     return `zoomMin must be an integer between 0 and ${MAX_ZOOM}`
   if (!Number.isInteger(c.zoomMax) || !inRange(c.zoomMax, 0, MAX_ZOOM))
@@ -1976,6 +1990,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
               tileSource,
               tileSubdomains,
               recurrency = "normal",
+              priority = 0,
               workers = 4,
               maxCallsPerMinute = 60,
               transport = "default",
@@ -1991,7 +2006,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
               return json({ error: "map not found" }, 404)
             }
 
-            const shapeError = validateCoverageShape({ regions, zoomMin, zoomMax, workers, maxCallsPerMinute })
+            const shapeError = validateCoverageShape({ regions, zoomMin, zoomMax, workers, maxCallsPerMinute, priority })
             if (shapeError) return json({ error: shapeError }, 400)
             const sourceError = await blockedTileSource(tileSource as string, tileSubdomains as string[])
             if (sourceError) return json({ error: sourceError }, 400)
@@ -2049,6 +2064,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
               tileSource: tileSource as string,
               tileSubdomains: (tileSubdomains as string[]) ?? ["a", "b", "c"],
               recurrency: (recurrency as Coverage["recurrency"]) ?? "normal",
+              priority: (priority as number) ?? 0,
               workers: (workers as number) ?? 4,
               maxCallsPerMinute: (maxCallsPerMinute as number) ?? 60,
               transport: transport as CoverageTransport,
@@ -2087,6 +2103,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
               tileSource,
               tileSubdomains,
               recurrency = "normal",
+              priority,
               workers,
               maxCallsPerMinute,
               transport,
@@ -2102,7 +2119,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
             const coverage = coverages.find((c) => c.id === id)
             if (!coverage) return json({ error: "not found" }, 404)
 
-            const updShapeError = validateCoverageShape({ regions, zoomMin, zoomMax, workers, maxCallsPerMinute })
+            const updShapeError = validateCoverageShape({ regions, zoomMin, zoomMax, workers, maxCallsPerMinute, priority })
             if (updShapeError) return json({ error: updShapeError }, 400)
             const updSourceError = await blockedTileSource(
               tileSource as string,
@@ -2155,6 +2172,12 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
             coverage.tileSource = tileSource as string
             coverage.tileSubdomains = (tileSubdomains as string[]) ?? ["a", "b", "c"]
             coverage.recurrency = (recurrency as Coverage["recurrency"]) ?? "normal"
+            // Re-order anything already waiting, so raising a priority takes
+            // effect on the current queue rather than only on the next run.
+            if (priority != null) {
+              coverage.priority = priority as number
+              broadcastQueue()
+            }
             if (workers != null) coverage.workers = workers as number
             if (maxCallsPerMinute != null) coverage.maxCallsPerMinute = maxCallsPerMinute as number
             if (transport != null) coverage.transport = transport as CoverageTransport

@@ -71,6 +71,12 @@ export type Coverage = {
   // Schedule hint
   recurrency: Recurrency
 
+  // Which queued run takes the next free slot. Higher goes first; absent is 0,
+  // so a deployment that has never set one stays plain FIFO. Ties keep their
+  // arrival order. This exists because a recurring refresh firing mid-seed used
+  // to take the slot ahead of seed work with no way to reorder the queue.
+  priority?: number
+
   // Lifetime stats
   createdAt: string
   lastRunAt: string | null
