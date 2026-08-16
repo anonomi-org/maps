@@ -1,0 +1,24 @@
+{
+  "_comment": "Bulk coverage to fill the 2 TB. Global z9-13 gives every user regional through town-level detail, which today exists only for Iberia. z14 over the populated continents adds street level on top. Antarctica is deliberately absent: at 47.9M tiles it is the single most expensive region on earth, because Mercator tiles cover almost no ground at that latitude, and it has no users.",
+  "tileSource": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+  "tileSubdomains": ["a"],
+  "transport": "default",
+  "maxCallsPerMinute": 120,
+  "workers": 4,
+  "recurrency": "low",
+
+  "_priority": "Below the running base corpus (0) and ordered by value per tile. The cheap global bands come before the hot-zone city passes at -10..-40; the heavy z13 and z14 blocks come after them.",
+  "entries": [
+    { "name": "World", "bbox": { "north": 85, "south": -85, "west": -180, "east": 180 }, "marginKm": 0, "zoomMin": 9,  "zoomMax": 9,  "priority": -1 },
+    { "name": "World", "bbox": { "north": 85, "south": -85, "west": -180, "east": 180 }, "marginKm": 0, "zoomMin": 10, "zoomMax": 10, "priority": -2 },
+    { "name": "World", "bbox": { "north": 85, "south": -85, "west": -180, "east": 180 }, "marginKm": 0, "zoomMin": 11, "zoomMax": 11, "priority": -3 },
+    { "name": "World", "bbox": { "north": 85, "south": -85, "west": -180, "east": 180 }, "marginKm": 0, "zoomMin": 12, "zoomMax": 12, "priority": -4 },
+
+    { "name": "World", "bbox": { "north": 85, "south": -85, "west": -180, "east": 180 }, "marginKm": 0, "zoomMin": 13, "zoomMax": 13, "priority": -50 },
+
+    { "name": "Europe",        "preset": "europe",        "zoomMin": 14, "zoomMax": 14, "priority": -60 },
+    { "name": "Asia",          "preset": "asia",          "zoomMin": 14, "zoomMax": 14, "priority": -61 },
+    { "name": "North America", "preset": "north-america", "zoomMin": 14, "zoomMax": 14, "priority": -62 },
+    { "name": "South America", "preset": "south-america", "zoomMin": 14, "zoomMax": 14, "priority": -63 }
+  ]
+}

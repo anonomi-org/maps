@@ -7,6 +7,9 @@ auth.json
 # network, which is the correlation the Tor transport exists to break.
 # hot-zones.example.json carries the structure.
 hot-zones.json
+# The bulk coverage plan. Same reasoning: what this server pulls is a
+# fingerprint of the service.
+regions.json
 maps.db
 maps.db-shm
 maps.db-wal
