@@ -991,3 +991,81 @@ describe("a failed run re-arms its own schedule", () => {
     expect(days).toBeLessThan(31)
   }, 30_000)
 })
+
+describe("coverage shape validation", () => {
+  let token: string
+  let mapId: string
+
+  beforeAll(async () => {
+    const login = await fetch(`${BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "correct-horse-battery" }),
+    })
+    token = (await login.json()).token as string
+    const map = await fetch(`${BASE}/api/maps/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: "shape map" }),
+    })
+    mapId = (await map.json()).map.id
+  })
+
+  async function create(regions: unknown, extra: Record<string, unknown> = {}) {
+    const res = await fetch(`${BASE}/api/coverages/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        mapId, name: `shape-${Math.round(performance.now() * 1000)}`,
+        regions, zoomMin: 0, zoomMax: 1,
+        tileSource: "https://unreachable.example.test/{z}/{x}/{y}.png",
+        tileSubdomains: ["a"], recurrency: "none", workers: 1, maxCallsPerMinute: 60,
+        ...extra,
+      }),
+    })
+    return { status: res.status, body: await res.json().catch(() => null) }
+  }
+
+  const point = (marginKm: number) => [{ name: "city", bbox: { north: 38.72, south: 38.72, west: -9.14, east: -9.14 }, marginKm }]
+
+  test("a city expressed as a point plus a radius is accepted", async () => {
+    // The shape a hot-zone list uses. Pre-computing a bbox instead would mean
+    // duplicating the latitude-corrected expansion outside the server.
+    const r = await create(point(25))
+    expect(r.status).toBe(200)
+    expect(r.body.coverage.totalTilesExpected).toBeGreaterThan(0)
+  })
+
+  test("a point with no radius is refused rather than downloading one column", async () => {
+    const r = await create(point(0))
+    expect(r.status).toBe(400)
+    expect(r.body.error).toContain("zero-area")
+  })
+
+  test("north below south is still refused", async () => {
+    const r = await create([{ name: "inverted", bbox: { north: 30, south: 40, west: -9, east: -8 }, marginKm: 5 }])
+    expect(r.status).toBe(400)
+  })
+
+  test("an ordinary region is unaffected", async () => {
+    const r = await create([{ name: "box", bbox: { north: 38.8, south: 38.7, west: -9.2, east: -9.1 }, marginKm: 0 }])
+    expect(r.status).toBe(200)
+  })
+
+  test("priority has to be an integer in range", async () => {
+    // The queue sorts on this, so a bad value would make the ordering
+    // incoherent rather than loud.
+    expect((await create(point(5), { priority: "high" })).status).toBe(400)
+    expect((await create(point(5), { priority: 1.5 })).status).toBe(400)
+    expect((await create(point(5), { priority: 99999 })).status).toBe(400)
+    expect((await create(point(5), { priority: -50 })).status).toBe(200)
+  })
+
+  test("a coverage created without a priority simply has none", async () => {
+    // Absent must stay absent, since that is what keeps an untouched
+    // deployment ordering its queue exactly as it did before.
+    const r = await create(point(5))
+    expect(r.status).toBe(200)
+    expect(r.body.coverage.priority ?? 0).toBe(0)
+  })
+})

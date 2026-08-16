@@ -712,9 +712,14 @@ function validateCoverageShape(c: {
       return "region latitudes must be between -90 and 90"
     if (!inRange(b.west, -180, 180) || !inRange(b.east, -180, 180))
       return "region longitudes must be between -180 and 180"
-    if (b.north <= b.south) return "region north must be greater than south"
+    if (b.north < b.south) return "region north cannot be south of south"
     if (r.marginKm != null && !inRange(r.marginKm, 0, 1000))
       return "region marginKm must be between 0 and 1000"
+    // A point region plus a margin is how a city-and-radius list is expressed,
+    // so a zero-area bbox is legal. Without a margin it is a zero-area request
+    // that would quietly download one tile column, which is never intended.
+    if (b.north === b.south && b.west === b.east && ((r.marginKm as number) ?? 0) <= 0)
+      return "a zero-area region needs a marginKm above 0"
   }
   return null
 }
