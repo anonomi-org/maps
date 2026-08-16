@@ -2,7 +2,7 @@ import { expect, test, describe } from "bun:test"
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
-import { main, isTileFile } from "./runner"
+import { main, isTileFile, generateAllTiles, countAllTiles } from "./runner"
 
 // The runner is spawned as its own process, so a module-evaluation error in it
 // is invisible to typecheck, to the build, and to any test that only imports it.
@@ -372,4 +372,81 @@ describe("validate reports its result to the server", () => {
       rmSync(dir, { recursive: true, force: true })
     }
   }, 30_000)
+})
+
+describe("walking a coverage's tiles", () => {
+  const iberia = [{ name: "iberia", bbox: { north: 43.8, south: 36, west: -9.3, east: 4.3 }, marginKm: 5 }]
+
+  // What collectAllTiles used to do, kept here as the reference the generator
+  // has to match. Order is not cosmetic: the directory cache in main() holds one
+  // {z}/{x} column at a time and only works because tiles arrive grouped that way.
+  function referenceOrder(regions: typeof iberia, zoomMin: number, zoomMax: number) {
+    const out: string[] = []
+    for (const r of regions) {
+      const d = (r.marginKm ?? 0) / 111
+      const south = r.bbox.south - d, north = r.bbox.north + d
+      const lonD = d / Math.cos((Math.max(Math.abs(south), Math.abs(north)) * Math.PI) / 180)
+      const west = r.bbox.west - lonD, east = r.bbox.east + lonD
+      for (let z = zoomMin; z <= zoomMax; z++) {
+        const n = 2 ** z
+        const tx = (lon: number) => Math.floor(((lon + 180) / 360) * n)
+        const ty = (lat: number) => {
+          const rad = (lat * Math.PI) / 180
+          return Math.floor(((1 - Math.log(Math.tan(Math.PI / 4 + rad / 2)) / Math.PI) / 2) * n)
+        }
+        const xmin = Math.max(0, Math.min(tx(west), tx(east)))
+        const xmax = Math.min(n - 1, Math.max(tx(west), tx(east)))
+        const ymin = Math.max(0, Math.min(ty(north), ty(south)))
+        const ymax = Math.min(n - 1, Math.max(ty(north), ty(south)))
+        for (let x = xmin; x <= xmax; x++) for (let y = ymin; y <= ymax; y++) out.push(`${z}/${x}/${y}`)
+      }
+    }
+    return out
+  }
+
+  test("yields exactly the sequence the materialised list used to", () => {
+    const got = [...generateAllTiles(iberia, 0, 8)].map(([z, x, y]) => `${z}/${x}/${y}`)
+    expect(got).toEqual(referenceOrder(iberia, 0, 8))
+  })
+
+  test("tiles arrive grouped by column, which the directory cache depends on", () => {
+    // One {z}/{x} column must be finished before the next begins, or the cache
+    // evicts and re-reads a directory per tile and the resume speedup is lost.
+    const seen = new Set<string>()
+    let current = ""
+    for (const [z, x] of generateAllTiles(iberia, 6, 9)) {
+      const col = `${z}/${x}`
+      if (col === current) continue
+      expect(seen.has(col)).toBe(false)
+      seen.add(col)
+      current = col
+    }
+  })
+
+  test("countAllTiles agrees with what the walk yields, filter and all", () => {
+    // These disagreeing is how a progress bar sticks short of the end forever.
+    const everyThird = (z: number, x: number, y: number) => (x + y) % 3 === 0
+    const counted = countAllTiles(iberia, 0, 8, everyThird)
+    const walked = [...generateAllTiles(iberia, 0, 8)]
+    expect(counted.total).toBe(walked.length)
+    expect(counted.kept).toBe(walked.filter(([z, x, y]) => everyThird(z, x, y)).length)
+  })
+
+  test("with no filter, kept and total are the same", () => {
+    const c = countAllTiles(iberia, 0, 6)
+    expect(c.kept).toBe(c.total)
+  })
+
+  test("a multi-million tile coverage walks in constant memory", () => {
+    // The reason this is a generator. The array it replaced measured 98.7 bytes
+    // per tile, so this same walk needed ~400 MB, and a global z13 coverage
+    // wanted 2.55 GB on a box with 1 GB of RAM: dead before the first fetch.
+    const world = [{ name: "world", bbox: { north: 85, south: -85, west: -180, east: 180 }, marginKm: 0 }]
+    const before = process.memoryUsage().rss
+    let n = 0
+    for (const _t of generateAllTiles(world, 11, 11)) n++
+    const after = process.memoryUsage().rss
+    expect(n).toBeGreaterThan(4_000_000)
+    expect(after - before).toBeLessThan(50 * 1024 * 1024)
+  }, 60_000)
 })

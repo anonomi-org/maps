@@ -56,12 +56,20 @@ export function expandRegion(region: CoverageRegion) {
   }
 }
 
-function collectAllTiles(
+// Yields rather than returns an array, and that is the whole point. Building the
+// list first cost a measured 98.7 bytes per tile, so a global z13 coverage
+// wanted 2.55 GB before its first fetch on a box with 1 GB of RAM: it would die
+// without ever asking for a tile. Nothing here is retained, so a coverage of any
+// size runs in constant memory and the only ceiling left is how long it takes.
+//
+// Order is unchanged, region by region then zoom by zoom then z/x/y, which the
+// directory cache in main() depends on: it holds one column at a time and only
+// works because tiles arrive grouped by {z}/{x}.
+export function* generateAllTiles(
   regions: CoverageRegion[],
   zoomMin: number,
   zoomMax: number,
-): [number, number, number][] {
-  const tiles: [number, number, number][] = []
+): Generator<[number, number, number]> {
   for (const region of regions) {
     const { south, north, west, east } = expandRegion(region)
     for (let z = zoomMin; z <= zoomMax; z++) {
@@ -72,10 +80,27 @@ function collectAllTiles(
       const ymax = Math.min(n - 1, Math.max(lat2tileY(north, z), lat2tileY(south, z)))
       for (let x = xmin; x <= xmax; x++)
         for (let y = ymin; y <= ymax; y++)
-          tiles.push([z, x, y])
+          yield [z, x, y]
     }
   }
-  return tiles
+}
+
+// Counts by walking, so the total the dashboard shows costs CPU and no memory.
+// keep is applied here exactly as the download pass applies it, because a total
+// that counted ocean the run then skips would leave the bar stuck short.
+export function countAllTiles(
+  regions: CoverageRegion[],
+  zoomMin: number,
+  zoomMax: number,
+  keep?: (z: number, x: number, y: number) => boolean,
+): { total: number; kept: number } {
+  let total = 0
+  let kept = 0
+  for (const [z, x, y] of generateAllTiles(regions, zoomMin, zoomMax)) {
+    total++
+    if (!keep || keep(z, x, y)) kept++
+  }
+  return { total, kept }
 }
 
 // ── Tile validation ────────────────────────────────────────────────────────────
@@ -312,17 +337,30 @@ export async function main(
   // so the failure mode is downloading too much, never too little.
   const { loadCachedLandMask, tileIsLand } = await import("./landMask")
   const masked = loadCachedLandMask()
-  const boxTiles = collectAllTiles(regions, zoomMin, zoomMax)
-  const allTiles = masked ? boxTiles.filter(([z, x, y]) => tileIsLand(z, x, y)) : boxTiles
+  const keep = masked ? (z: number, x: number, y: number) => tileIsLand(z, x, y) : undefined
+  // One pass to count, a second to download. Two walks of pure arithmetic cost
+  // far less than holding the list, and holding it is what a large coverage
+  // cannot afford.
+  const counted = countAllTiles(regions, zoomMin, zoomMax, keep)
   if (masked) {
-    console.log(`land mask: ${allTiles.length} of ${boxTiles.length} tiles are land, skipping ${boxTiles.length - allTiles.length} ocean`)
+    console.log(`land mask: ${counted.kept} of ${counted.total} tiles are land, skipping ${counted.total - counted.kept} ocean`)
   } else {
     console.warn("land mask: no cache found, downloading the full bounding box including ocean")
   }
-  progress.total = allTiles.length
+  progress.total = counted.kept
   await postProgress(progressUrl, internalToken, progress)
 
-  let idx = 0
+  // Workers pull from one generator. next() runs to completion before any other
+  // worker can call it, since these are async tasks on a single thread rather
+  // than real threads, so no two workers can be handed the same tile.
+  const tiles = generateAllTiles(regions, zoomMin, zoomMax)
+  function nextTile(): [number, number, number] | null {
+    for (;;) {
+      const r = tiles.next()
+      if (r.done) return null
+      if (!keep || keep(r.value[0], r.value[1], r.value[2])) return r.value
+    }
+  }
   let consecutiveDiskErrors = 0
   // Directories this run has already created, shared across workers.
   const createdDirs = new Set<string>()
@@ -396,10 +434,10 @@ export async function main(
         return
       }
 
-      const i = idx++
-      if (i >= allTiles.length) break
+      const tile = nextTile()
+      if (tile === null) break
 
-      const [z, x, y] = allTiles[i]
+      const [z, x, y] = tile
 
       // A tile written on an earlier run may carry either extension, so both
       // are checked. Looking for only one makes resume re-download everything
