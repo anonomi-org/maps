@@ -43,14 +43,39 @@ export type TileRegion = {
   zoomMax: number
 }
 
-function expandRegion(region: TileRegion) {
-  const marginDeg = (region.marginKm ?? 0) / 111
+// A degree of latitude is ~111 km everywhere, but a degree of longitude is that
+// only at the equator and shrinks by cos(lat) toward the poles. Converting the
+// margin once and applying it to both axes therefore under-covers east to west
+// by exactly that factor: 25 km asked for at Saint Petersburg bought 12.5 km,
+// and every region came out a tall thin rectangle instead of the square the
+// operator drew. Latitude and longitude get their own conversion.
+//
+// Anything that expands a region has to call this. The conversion used to be
+// copied into four places, and the copy in isTileInCoverageList decides which
+// tiles cleanup keeps, so a version that disagreed with the runner's would
+// delete tiles the runner had just downloaded.
+const KM_PER_DEG_LAT = 111
+
+export function expandBbox(bbox: Bbox, marginKm: number): Bbox {
+  const marginLat = (marginKm ?? 0) / KM_PER_DEG_LAT
+  const south = clampLat(bbox.south - marginLat)
+  const north = clampLat(bbox.north + marginLat)
+  // Scale by whichever edge sits furthest from the equator, so the whole box
+  // gets at least the margin asked for rather than only its middle. Taking it
+  // after clampLat also bounds cos() below at cos(85.05 deg), so a region at the
+  // pole widens by 11.5x rather than dividing by zero.
+  const worstLat = Math.max(Math.abs(south), Math.abs(north))
+  const marginLon = marginLat / Math.cos((worstLat * Math.PI) / 180)
   return {
-    south: clampLat(region.bbox.south - marginDeg),
-    north: clampLat(region.bbox.north + marginDeg),
-    west: region.bbox.west - marginDeg,
-    east: region.bbox.east + marginDeg,
+    south,
+    north,
+    west: bbox.west - marginLon,
+    east: bbox.east + marginLon,
   }
+}
+
+function expandRegion(region: TileRegion) {
+  return expandBbox(region.bbox, region.marginKm ?? 0)
 }
 
 function tileRange(region: TileRegion, z: number) {

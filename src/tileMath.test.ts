@@ -6,8 +6,10 @@ import {
   buildTileUrl,
   countTiles,
   collectTiles,
+  expandBbox,
   type TileRegion,
 } from "./tileMath"
+import { expandRegion as runnerExpandRegion } from "./runner"
 
 // A region covering roughly the Lisbon area, used across the range tests.
 function lisbon(overrides: Partial<TileRegion> = {}): TileRegion {
@@ -123,6 +125,89 @@ describe("counting tiles", () => {
   test("no tile is emitted twice", () => {
     const tiles = collectTiles(lisbon({ zoomMax: 8 }))
     expect(new Set(tiles.map((t) => t.join("/"))).size).toBe(tiles.length)
+  })
+})
+
+describe("margin expansion", () => {
+  // How many km a longitude span actually covers on the ground at a latitude.
+  function ewKm(lonDelta: number, lat: number): number {
+    return lonDelta * 111 * Math.cos((lat * Math.PI) / 180)
+  }
+
+  // Small boxes around real hot-zone candidates, spanning the useful range of
+  // latitudes. Saint Petersburg is the case that motivated the fix.
+  const CITIES = [
+    { name: "Singapore", lat: 1.35 },
+    { name: "Lisbon", lat: 38.72 },
+    { name: "London", lat: 51.51 },
+    { name: "Moscow", lat: 55.75 },
+    { name: "Saint Petersburg", lat: 59.94 },
+  ]
+
+  function box(lat: number, lon = 0) {
+    return { north: lat + 0.05, south: lat - 0.05, west: lon - 0.05, east: lon + 0.05 }
+  }
+
+  test("a margin delivers its km east to west, not just north to south", () => {
+    // The old conversion applied the equator's 111 km/deg to longitude too, so
+    // this bought marginKm * cos(lat) and every northern city came out narrow.
+    for (const city of CITIES) {
+      const b = box(city.lat)
+      const e = expandBbox(b, 25)
+      const worstLat = Math.max(Math.abs(e.north), Math.abs(e.south))
+      expect(ewKm(e.east - b.east, worstLat)).toBeGreaterThanOrEqual(24.9)
+      expect(ewKm(b.west - e.west, worstLat)).toBeGreaterThanOrEqual(24.9)
+      // North to south was always right, and must stay right.
+      expect((e.north - b.north) * 111).toBeCloseTo(25, 1)
+    }
+  })
+
+  test("the equator is left alone, so this is a fix and not a blanket widening", () => {
+    const b = box(0)
+    const e = expandBbox(b, 25)
+    // Not exactly equal: the scale comes from the box's furthest edge rather
+    // than its middle, so a box straddling the equator overshoots by 0.3 m.
+    // What matters is that it is not the cos(lat)-sized widening seen up north.
+    const ratio = (e.east - b.east) / (e.north - b.north)
+    expect(ratio).toBeGreaterThan(1)
+    expect(ratio).toBeLessThan(1.0001)
+  })
+
+  test("higher latitude widens more", () => {
+    const widths = CITIES.map((c) => {
+      const b = box(c.lat)
+      return expandBbox(b, 25).east - b.east
+    })
+    for (let i = 1; i < widths.length; i++) {
+      expect(widths[i]!).toBeGreaterThan(widths[i - 1]!)
+    }
+  })
+
+  test("a region at the pole widens by a bounded amount instead of dividing by zero", () => {
+    const e = expandBbox({ north: 89.9, south: 89.8, west: -1, east: 1 }, 25)
+    expect(Number.isFinite(e.east)).toBe(true)
+    expect(Number.isFinite(e.west)).toBe(true)
+    // clampLat holds the latitude at 85.05 deg, where 1/cos is ~11.5.
+    expect(e.east - 1).toBeLessThan(25 / 111 * 12)
+  })
+
+  test("a zero margin changes nothing", () => {
+    const b = box(51.51, -0.13)
+    expect(expandBbox(b, 0)).toEqual({ north: b.north, south: b.south, west: b.west, east: b.east })
+  })
+
+  test("the runner expands regions exactly as tileMath does", () => {
+    // These are separate copies on purpose, and the runner's decides what is
+    // downloaded while tileMath's decides what cleanup keeps. Drift between them
+    // deletes freshly downloaded tiles, so it is pinned here rather than trusted.
+    for (const city of CITIES) {
+      for (const marginKm of [0, 5, 25, 50]) {
+        const bbox = box(city.lat, 10)
+        expect(runnerExpandRegion({ name: city.name, bbox, marginKm })).toEqual(
+          expandBbox(bbox, marginKm),
+        )
+      }
+    }
   })
 })
 

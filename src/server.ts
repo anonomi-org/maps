@@ -4,7 +4,7 @@ import { lookup as dnsLookup } from "dns/promises"
 import { stat, rm, readdir, unlink, access, mkdir, writeFile } from "fs/promises"
 import { join, dirname, isAbsolute } from "path"
 import type { Bbox, CleanupProgress, Coverage, CoverageRun, CoverageTransport, TileFormat, DiscoFile, DiscoMap, LogSettings, Recurrency, RetentionUnit, RunMode, ServerState, SSEEvent, TileMap, TileTransport } from "./types"
-import { countTiles, iterateTiles, buildTileUrl, lon2tileX, lat2tileY, clampLat } from "./tileMath"
+import { countTiles, iterateTiles, buildTileUrl, lon2tileX, lat2tileY, clampLat, expandBbox } from "./tileMath"
 import { validateTile, isTileFile } from "./runner"
 import { RateLimiter, parseRetryAfter, RETRY_AFTER_DEFAULT_MS } from "./rateLimit"
 import { initLandMask, tileIsLand, isLand, maskReady } from "./landMask"
@@ -863,13 +863,11 @@ function isTileInCoverageList(z: number, x: number, y: number, list: Coverage[])
   for (const cov of list) {
     if (z < cov.zoomMin || z > cov.zoomMax) continue
     for (const region of cov.regions) {
-      const md = (region.marginKm ?? 0) / 111
-      if (
-        tb.west < region.bbox.east + md &&
-        tb.east > region.bbox.west - md &&
-        tb.south < region.bbox.north + md &&
-        tb.north > region.bbox.south - md
-      )
+      // Has to expand exactly the way the runner does. A margin narrower here
+      // than the one the download used marks freshly written tiles as unwanted,
+      // and cleanup deletes them on the next pass.
+      const e = expandBbox(region.bbox, region.marginKm ?? 0)
+      if (tb.west < e.east && tb.east > e.west && tb.south < e.north && tb.north > e.south)
         return true
     }
   }
@@ -1009,11 +1007,11 @@ function estimateLandTiles(
     iterateTiles(tr, (z, x, y) => { if (tileIsLand(z, x, y)) count++ })
     return count
   }
-  const marginDeg = marginKm / 111
-  const s = Math.max(-85, bbox.south - marginDeg)
-  const n = Math.min(85, bbox.north + marginDeg)
-  const w = bbox.west - marginDeg
-  const e = bbox.east + marginDeg
+  const expanded = expandBbox(bbox, marginKm)
+  const s = Math.max(-85, expanded.south)
+  const n = Math.min(85, expanded.north)
+  const w = expanded.west
+  const e = expanded.east
   const RES = 0.25
   let gridTotal = 0, gridLand = 0
   for (let lat = s + RES / 2; lat <= n; lat += RES) {

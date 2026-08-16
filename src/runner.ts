@@ -38,13 +38,21 @@ function buildTileUrl(template: string, z: number, x: number, y: number, s?: str
     .replace("{y}", String(y))
 }
 
-function expandRegion(region: CoverageRegion) {
-  const marginDeg = (region.marginKm ?? 0) / 111
+// Kept in step with expandBbox in tileMath.ts by a test, because this copy
+// decides what gets downloaded while that one decides what gets counted and,
+// through isTileInCoverageList, what cleanup keeps. See the note there for why
+// longitude needs its own conversion.
+export function expandRegion(region: CoverageRegion) {
+  const marginLat = (region.marginKm ?? 0) / 111
+  const south = clampLat(region.bbox.south - marginLat)
+  const north = clampLat(region.bbox.north + marginLat)
+  const worstLat = Math.max(Math.abs(south), Math.abs(north))
+  const marginLon = marginLat / Math.cos((worstLat * Math.PI) / 180)
   return {
-    south: clampLat(region.bbox.south - marginDeg),
-    north: clampLat(region.bbox.north + marginDeg),
-    west:  region.bbox.west - marginDeg,
-    east:  region.bbox.east + marginDeg,
+    south,
+    north,
+    west:  region.bbox.west - marginLon,
+    east:  region.bbox.east + marginLon,
   }
 }
 
