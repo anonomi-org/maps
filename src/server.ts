@@ -1263,6 +1263,8 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
   let interruptedCount = 0
   for (const run of allRuns) {
     if (run.status === "running" || run.status === "paused") {
+      // Captured before the status is overwritten below.
+      const wasRunning = run.status === "running"
       run.status = "error"
       run.error = "Interrupted by server restart"
       run.endedAt = new Date().toISOString()
@@ -1271,6 +1273,20 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
       if (cov && run.startedAt && (!cov.lastRunAt || run.startedAt > cov.lastRunAt)) {
         cov.lastRunAt = run.endedAt
         cov.lastRunStatus = "failed"
+        // Arm the retry the way run-complete would have. A run that died with
+        // the server never reaches that handler, so marking the coverage failed
+        // and stopping there leaves nextRunAt untouched: if it was null the
+        // coverage goes dormant permanently and only a manual start revives it.
+        // That is how World base and Portugal were stranded on 2026-08-14.
+        //
+        // Only for "running". A paused run was stopped on purpose, and
+        // restarting it five minutes after a reboot argues with the operator
+        // the same way re-arming a cancelled run would.
+        if (wasRunning && cov.recurrency !== "none") {
+          const n = (cov.consecutiveFailures ?? 0) + 1
+          cov.consecutiveFailures = n
+          cov.nextRunAt = n <= RETRY_MAX ? computeRetryAt(n) : computeNextRunAt(cov.recurrency)
+        }
       }
     }
   }
@@ -1282,6 +1298,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
 
   // Queued runs never survive a restart, because the child processes died with us.
   let lostQueued = 0
+  const revived = new Set<string>()
   for (const run of allRuns) {
     if (run.status !== "queued") continue
     run.status = "error"
@@ -1289,8 +1306,26 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
     run.endedAt = new Date().toISOString()
     dbSaveRun(run)
     lostQueued++
+
+    // The run never executed, so this is not a failure and must not burn retry
+    // budget or mark the coverage failed. But a coverage started by hand has no
+    // nextRunAt to fall back on, so doing nothing here drops the request on the
+    // floor: the operator queued work and a restart silently discarded it. Give
+    // it a near-term slot instead, and let the re-arm loop below pick it up.
+    const cov = covById.get(run.coverageId)
+    if (cov && cov.recurrency !== "none" && !cov.nextRunAt) {
+      cov.nextRunAt = computeRetryAt(1)
+      revived.add(cov.id)
+    }
   }
-  if (lostQueued > 0) console.log(`  marked ${lostQueued} queued run(s) as lost`)
+  if (lostQueued > 0) {
+    for (const id of revived) {
+      const cov = covById.get(id)
+      if (cov) dbSaveCoverage(cov)
+    }
+    console.log(`  marked ${lostQueued} queued run(s) as lost` +
+      (revived.size > 0 ? `, re-queued ${revived.size} coverage(s) that had no schedule` : ""))
+  }
 
   // Re-arm schedules from each coverage's own nextRunAt.
   let seeded = 0, pastDue = 0
