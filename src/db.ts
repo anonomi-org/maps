@@ -61,6 +61,17 @@ export function initSchema(): void {
   `)
   db.run(`CREATE INDEX IF NOT EXISTS idx_runs_coverage_id ON runs(coverage_id)`)
   db.run(`CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC)`)
+  // Sessions outlive a restart so that deploying does not sign the operator
+  // out. Only a SHA-256 of each token is kept: this file is backed up and
+  // copied around, and a raw token sitting in one of those copies is a live
+  // credential to whoever reads it. A hash still answers "is this token one we
+  // issued" and is worth nothing on its own.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token_hash TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL
+    )
+  `)
 
   importLegacyJson()
 }
@@ -223,6 +234,33 @@ export function dbCapRuns(): void {
       WHERE rn > 50
     )
   `)
+}
+
+// ---- Sessions ----
+
+// Expired rows are dropped on the way out rather than by a sweeper, because the
+// only moment the table is read is startup and that is exactly when clearing it
+// is free.
+export function dbLoadSessions(now: number): Array<{ tokenHash: string; expiresAt: number }> {
+  db.query(`DELETE FROM sessions WHERE expires_at <= ?`).run(now)
+  return db
+    .query<{ token_hash: string; expires_at: number }, []>(`SELECT token_hash, expires_at FROM sessions`)
+    .all()
+    .map((r) => ({ tokenHash: r.token_hash, expiresAt: r.expires_at }))
+}
+
+export function dbSaveSession(tokenHash: string, expiresAt: number): void {
+  db.query(`INSERT INTO sessions (token_hash, expires_at) VALUES (?, ?)
+            ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at`)
+    .run(tokenHash, expiresAt)
+}
+
+export function dbDeleteSession(tokenHash: string): void {
+  db.query(`DELETE FROM sessions WHERE token_hash = ?`).run(tokenHash)
+}
+
+export function dbClearSessions(): void {
+  db.query(`DELETE FROM sessions`).run()
 }
 
 export function dbClose(): void {

@@ -12,6 +12,7 @@ import { queueInStartOrder, nextInStartOrder } from "./runQueue"
 import { scheduleAfterRun, type RunOutcome } from "./schedule"
 import {
   initSchema,
+  dbLoadSessions, dbSaveSession, dbDeleteSession, dbClearSessions,
   dbLoadMaps, dbSaveMap, dbDeleteMap,
   dbLoadCoverages, dbSaveCoverage, dbDeleteCoverage, dbDeleteCoveragesByMapId,
   dbLoadRuns, dbSaveRun, dbDeleteRunsByCoverageId, dbDeleteRunsByMapId,
@@ -1107,20 +1108,51 @@ function clearLoginFailures(ip: string) {
   loginFailures.delete(ip)
 }
 
-const sessions = new Map<string, number>()
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+// How stale the stored expiry may get. Writing on every request would be a
+// database write per API call to buy nothing: the in-memory copy is
+// authoritative while the process lives, and the stored one only has to be
+// close enough that a restart does not sign someone out early.
+const SESSION_PERSIST_INTERVAL_MS = 60 * 60 * 1000
+
+// Keyed by token hash, not the token. Sessions are mirrored to the database so
+// they survive a restart, and only the hash is stored, so the map matches.
+const sessions = new Map<string, { expiresAt: number; persistedAt: number }>()
+
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex")
+}
 
 function isValidToken(token: string | null): boolean {
   if (!token) return false
-  const exp = sessions.get(token)
-  if (!exp || Date.now() > exp) { sessions.delete(token); return false }
-  sessions.set(token, Date.now() + 7 * 24 * 60 * 60 * 1000)
+  const hash = hashToken(token)
+  const s = sessions.get(hash)
+  if (!s || Date.now() > s.expiresAt) {
+    if (s) { sessions.delete(hash); dbDeleteSession(hash) }
+    return false
+  }
+  s.expiresAt = Date.now() + SESSION_TTL_MS
+  if (Date.now() - s.persistedAt > SESSION_PERSIST_INTERVAL_MS) {
+    s.persistedAt = Date.now()
+    dbSaveSession(hash, s.expiresAt)
+  }
   return true
 }
 
 function createSession(): string {
   const token = crypto.randomUUID() + "-" + crypto.randomUUID()
-  sessions.set(token, Date.now() + 7 * 24 * 60 * 60 * 1000)
+  const hash = hashToken(token)
+  const expiresAt = Date.now() + SESSION_TTL_MS
+  sessions.set(hash, { expiresAt, persistedAt: Date.now() })
+  dbSaveSession(hash, expiresAt)
   return token
+}
+
+// Every session at once. Used when the password changes, where the point is
+// that anything issued under the old one stops working immediately.
+function clearAllSessions(): void {
+  sessions.clear()
+  dbClearSessions()
 }
 
 function isLoopbackAddress(ip: string): boolean {
@@ -1249,6 +1281,17 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
   maps.push(...dbLoadMaps())
   coverages.push(...dbLoadCoverages())
   allRuns.push(...dbLoadRuns())
+
+  // Sessions used to live only in memory, so every deploy signed the operator
+  // out and any automation holding a token started failing with a 401 that
+  // looked like a bug. Restoring them keeps a restart invisible.
+  {
+    const restored = dbLoadSessions(Date.now())
+    for (const s of restored) {
+      sessions.set(s.tokenHash, { expiresAt: s.expiresAt, persistedAt: Date.now() })
+    }
+    if (restored.length > 0) console.log(`  restored ${restored.length} session(s)`)
+  }
 
   // disco.json was only written when a map changed, so a server with no maps
   // yet served 404 there and the Android client reported an error instead of an
@@ -1732,7 +1775,10 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
       }
 
       if (pathname === "/api/auth/logout" && req.method === "POST") {
-        sessions.delete(getToken(req) ?? "")
+        {
+          const t = getToken(req)
+          if (t) { const h = hashToken(t); sessions.delete(h); dbDeleteSession(h) }
+        }
         return json({ ok: true })
       }
 
@@ -2425,7 +2471,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
             if (newUsername?.trim()) authData.username = newUsername.trim()
             if (newPassword) authData.passwordHash = await Bun.password.hash(newPassword)
             writeAuthFile()
-            sessions.clear()
+            clearAllSessions()
             return json({ ok: true })
           }
 
