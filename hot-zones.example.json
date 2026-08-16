@@ -6,12 +6,15 @@
   "maxCallsPerMinute": 120,
   "workers": 4,
 
-  "_bands": "One coverage per entry. Higher priority takes a free worker slot first. Each zoom is roughly 4x the tiles of the one below it, so shallow bands finish across the whole list quickly and the deepest band is most of the total cost.",
+  "_recurrency": "Defaults to low. Do not use none: a coverage that never recurs gets no retry when a run fails and no short retry when one finishes with tiles missing, so a single dropped connection leaves it dormant.",
+  "recurrency": "low",
+
+  "_bands": "One coverage per entry. Higher priority takes a free worker slot first, and a coverage with no priority counts as 0. Keep these negative if a base corpus should finish ahead of the high-zoom passes. Each zoom is roughly 4x the tiles of the one below it, so shallow bands finish across the whole list quickly and the deepest band is most of the total cost.",
   "bands": [
-    { "zoomMin": 14, "zoomMax": 14, "priority": 40 },
-    { "zoomMin": 15, "zoomMax": 15, "priority": 30 },
-    { "zoomMin": 16, "zoomMax": 16, "priority": 20 },
-    { "zoomMin": 17, "zoomMax": 17, "priority": 10 }
+    { "zoomMin": 14, "zoomMax": 14, "priority": -10 },
+    { "zoomMin": 15, "zoomMax": 15, "priority": -20 },
+    { "zoomMin": 16, "zoomMax": 16, "priority": -30 },
+    { "zoomMin": 17, "zoomMax": 17, "priority": -40 }
   ],
 
   "_cities": "Sorted by tier, then by the order written here. A city is a point plus a radius; the server does the latitude-corrected expansion, so do not pre-compute a bbox.",

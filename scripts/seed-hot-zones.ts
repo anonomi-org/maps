@@ -32,6 +32,13 @@ type HotZoneFile = {
   transport?: "default" | "clearnet" | "tor"
   maxCallsPerMinute?: number
   workers?: number
+  // Defaults to "low". Deliberately not "none": a coverage that never recurs
+  // is skipped by applySchedule, so it gets no retry when a run fails and no
+  // short retry when one finishes with tiles missing. A seed band is the last
+  // thing that should go dormant on a dropped connection, and the 90 day
+  // interval doubles as an imagery refresh that costs almost nothing because a
+  // resume skips everything already on disk.
+  recurrency?: "high" | "normal" | "low" | "none"
   // One coverage is created per entry, in this order.
   bands: { zoomMin: number; zoomMax: number; priority: number }[]
   cities: City[]
@@ -80,9 +87,7 @@ for (const band of spec.bands) {
     zoomMax: band.zoomMax,
     tileSource: spec.tileSource,
     tileSubdomains: spec.tileSubdomains ?? ["a", "b", "c"],
-    // Seed passes are one-shot. Recurrence here would re-walk the whole list on
-    // a timer while later bands are still trying to finish for the first time.
-    recurrency: "none",
+    recurrency: spec.recurrency ?? "low",
     priority: band.priority,
     workers: spec.workers ?? 4,
     maxCallsPerMinute: spec.maxCallsPerMinute ?? 120,
