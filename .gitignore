@@ -2,6 +2,11 @@ node_modules/
 dist/
 config.json
 auth.json
+# The seed target list. Publishing which cities this service pulls at high zoom
+# hands an observer the exact traffic pattern to watch for on the downloading
+# network, which is the correlation the Tor transport exists to break.
+# hot-zones.example.json carries the structure.
+hot-zones.json
 maps.db
 maps.db-shm
 maps.db-wal
