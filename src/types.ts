@@ -87,6 +87,11 @@ export type Coverage = {
   // Consecutive failures since the last success, which drives the retry
   // backoff. Absent on rows written before retries existed; treat as 0.
   consecutiveFailures?: number
+  // Consecutive runs that finished but left some tiles failed. Drives a short
+  // retry so a handful of dropped tiles do not wait out the whole recurrency
+  // interval. Separate from consecutiveFailures because a partial run mostly
+  // succeeded, and mixing them would let a partial look like a continued outage.
+  consecutivePartials?: number
 
   // Tile inventory
   totalTilesExpected: number

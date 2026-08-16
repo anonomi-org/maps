@@ -9,6 +9,7 @@ import { validateTile, isTileFile } from "./runner"
 import { RateLimiter, parseRetryAfter, RETRY_AFTER_DEFAULT_MS } from "./rateLimit"
 import { initLandMask, tileIsLand, isLand, maskReady } from "./landMask"
 import { queueInStartOrder, nextInStartOrder } from "./runQueue"
+import { scheduleAfterRun, type RunOutcome } from "./schedule"
 import {
   initSchema,
   dbLoadMaps, dbSaveMap, dbDeleteMap,
@@ -752,7 +753,6 @@ function computeNextRunAt(recurrency: Recurrency): string {
 // Retries use their own backoff rather than the configured interval, because
 // that interval is 7 to 90 days — long enough that "retry at the normal time"
 // is indistinguishable from giving up.
-const RETRY_MAX = 5
 const RETRY_BASE_MS = 5 * 60_000
 const RETRY_CAP_MS = 6 * 60 * 60_000
 
@@ -797,6 +797,21 @@ function scheduleNextRun(coverage: Coverage) {
     )
   }, delay)
   scheduledTimers.set(coverage.id, timer)
+}
+
+// Turns a schedule decision into a date and arms it. The policy of which
+// cadence applies lives in schedule.ts so it can be tested without a listener;
+// this half owns the clock and the timer. Counters are written even for a
+// coverage that never recurs, so that turning recurrency back on later starts
+// from an honest history rather than a stale one.
+function applySchedule(coverage: Coverage, outcome: RunOutcome) {
+  const s = scheduleAfterRun(outcome, coverage)
+  coverage.consecutiveFailures = s.consecutiveFailures
+  coverage.consecutivePartials = s.consecutivePartials
+  if (coverage.recurrency === "none") return
+  coverage.nextRunAt =
+    s.choice.kind === "retry" ? computeRetryAt(s.choice.attempt) : computeNextRunAt(coverage.recurrency)
+  scheduleNextRun(coverage)
 }
 
 function cancelScheduledRun(coverageId: string) {
@@ -1287,10 +1302,18 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
         // Only for "running". A paused run was stopped on purpose, and
         // restarting it five minutes after a reboot argues with the operator
         // the same way re-arming a cancelled run would.
-        if (wasRunning && cov.recurrency !== "none") {
-          const n = (cov.consecutiveFailures ?? 0) + 1
-          cov.consecutiveFailures = n
-          cov.nextRunAt = n <= RETRY_MAX ? computeRetryAt(n) : computeNextRunAt(cov.recurrency)
+        // Same policy as an ordinary failure, so a run that died with the
+        // server means the same thing as one that reported its own failure.
+        // The timer is left to the re-arm loop below rather than armed here,
+        // since it has not been set up yet at this point in startup.
+        if (wasRunning) {
+          const s = scheduleAfterRun("failed", cov)
+          cov.consecutiveFailures = s.consecutiveFailures
+          cov.consecutivePartials = s.consecutivePartials
+          if (cov.recurrency !== "none") {
+            cov.nextRunAt =
+              s.choice.kind === "retry" ? computeRetryAt(s.choice.attempt) : computeNextRunAt(cov.recurrency)
+          }
         }
       }
     }
@@ -1502,14 +1525,14 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
             coverage.lastRunAt = run.endedAt
 
             if (finalStatus === "done") {
-              coverage.lastRunStatus = run.failed > 0 ? "partial" : "success"
-              coverage.consecutiveFailures = 0
+              // Reached the end of the list. "partial" means it got there but
+              // lost tiles on the way, which is a different thing from an
+              // outage and gets its own, shorter, retry budget.
+              const outcome: RunOutcome = run.failed > 0 ? "partial" : "success"
+              coverage.lastRunStatus = outcome
               if (body.tilesOnDisk != null) coverage.tilesOnDisk = body.tilesOnDisk
               if (body.sizeBytes != null) coverage.sizeBytes = body.sizeBytes
-              if (coverage.recurrency !== "none") {
-                coverage.nextRunAt = computeNextRunAt(coverage.recurrency)
-                scheduleNextRun(coverage)
-              }
+              applySchedule(coverage, outcome)
             } else if (finalStatus === "cancelled") {
               // Deliberate stop. Leave the schedule exactly as it was rather
               // than arguing with the person who pressed cancel.
@@ -1517,17 +1540,7 @@ initLandMask().catch((e) => console.error("  land mask error:", e))
             } else {
               coverage.lastRunStatus = "failed"
               coverage.totalFailedRuns++
-              if (coverage.recurrency !== "none") {
-                const n = (coverage.consecutiveFailures ?? 0) + 1
-                coverage.consecutiveFailures = n
-                // After RETRY_MAX consecutive failures the fault is not
-                // transient, so fall back to the configured interval instead
-                // of retrying against a source or a disk that is not coming
-                // back. The coverage stays scheduled either way.
-                coverage.nextRunAt =
-                  n <= RETRY_MAX ? computeRetryAt(n) : computeNextRunAt(coverage.recurrency)
-                scheduleNextRun(coverage)
-              }
+              applySchedule(coverage, "failed")
             }
 
             await dbSaveCoverage(coverage)
